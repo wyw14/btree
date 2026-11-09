@@ -4919,3 +4919,740 @@ func TestMapStringKey3(t *testing.T) {
 	}
 	assert(m.Len() == N)
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Map.Diff
+////////////////////////////////////////////////////////////////////////////////
+
+type diffRec[K cmp.Ordered, V any] struct {
+	key K
+	ch  DiffChange[V]
+}
+
+// naiveMapDiff is the deliberately simple reference implementation: an
+// ordered linear merge of the two All() iterators with no sharing awareness.
+// Presence is tracked with the ok flags, so zero values stay distinct from
+// missing keys.
+func naiveMapDiff[K cmp.Ordered, V any](a, b *Map[K, V],
+	eq func(V, V) bool,
+) []diffRec[K, V] {
+	nextA, stopA := iter.Pull2(a.All())
+	defer stopA()
+	nextB, stopB := iter.Pull2(b.All())
+	defer stopB()
+	ak, av, okA := nextA()
+	bk, bv, okB := nextB()
+	var recs []diffRec[K, V]
+	for okA || okB {
+		switch {
+		case okA && (!okB || ak < bk):
+			recs = append(recs, diffRec[K, V]{
+				key: ak, ch: DiffChange[V]{Op: DiffDelete, Old: av},
+			})
+			ak, av, okA = nextA()
+		case okB && (!okA || bk < ak):
+			recs = append(recs, diffRec[K, V]{
+				key: bk, ch: DiffChange[V]{Op: DiffInsert, New: bv},
+			})
+			bk, bv, okB = nextB()
+		default:
+			assert(ak == bk)
+			if !eq(av, bv) {
+				recs = append(recs, diffRec[K, V]{
+					key: ak,
+					ch:  DiffChange[V]{Op: DiffModify, Old: av, New: bv},
+				})
+			}
+			ak, av, okA = nextA()
+			bk, bv, okB = nextB()
+		}
+	}
+	return recs
+}
+
+// runMapDiff runs the structural walker and returns its records plus the
+// shared-subtree skip count.
+func runMapDiff[K cmp.Ordered, V any](a, b *Map[K, V],
+	eq func(V, V) bool,
+) ([]diffRec[K, V], int) {
+	var recs []diffRec[K, V]
+	skips := mapDiffRun(&a.tree, &b.tree, eq,
+		func(key K, ch DiffChange[V]) bool {
+			recs = append(recs, diffRec[K, V]{key, ch})
+			return true
+		})
+	return recs, skips
+}
+
+func assertDiffRecsEqual[K cmp.Ordered, V comparable](
+	got, want []diffRec[K, V],
+) {
+	assert(len(got) == len(want))
+	var prev K
+	for i := range want {
+		assert(got[i].key == want[i].key)
+		assert(got[i].ch.Op == want[i].ch.Op)
+		assert(got[i].ch.Old == want[i].ch.Old)
+		assert(got[i].ch.New == want[i].ch.New)
+		if i > 0 {
+			assert(prev < got[i].key) // strictly ascending output
+		}
+		prev = got[i].key
+	}
+}
+
+func collectMapNodes[K cmp.Ordered, V any](m *Map[K, V],
+) map[*node[K, V]]bool {
+	out := make(map[*node[K, V]]bool)
+	var walk func(n *node[K, V])
+	walk = func(n *node[K, V]) {
+		if n == nil || out[n] {
+			return
+		}
+		out[n] = true
+		if !n.leaf() {
+			for i := 0; i <= n.len; i++ {
+				walk(n.branch.children[i])
+			}
+		}
+	}
+	walk(m.tree.root)
+	return out
+}
+
+// collectNodePaths maps every node pointer to the index paths at which it
+// appears below the root. It lets a test prove that shared nodes can sit at
+// different parent positions.
+func collectNodePaths[K cmp.Ordered, V any](m *Map[K, V],
+) map[*node[K, V]][][]int {
+	out := make(map[*node[K, V]][][]int)
+	var walk func(n *node[K, V], path []int)
+	walk = func(n *node[K, V], path []int) {
+		if n == nil {
+			return
+		}
+		out[n] = append(out[n], slices.Clone(path))
+		if !n.leaf() {
+			for i := 0; i <= n.len; i++ {
+				walk(n.branch.children[i], append(path, i))
+			}
+		}
+	}
+	walk(m.tree.root, nil)
+	return out
+}
+
+func snapshotNodeRC[K cmp.Ordered, V any](m *Map[K, V],
+) map[*node[K, V]]int64 {
+	snap := make(map[*node[K, V]]int64)
+	for n := range collectMapNodes(m) {
+		snap[n] = n.rc.Load()
+	}
+	return snap
+}
+
+func assertRCSnapshot[K cmp.Ordered, V any](m *Map[K, V],
+	snap map[*node[K, V]]int64,
+) {
+	nodes := collectMapNodes(m)
+	assert(len(nodes) == len(snap))
+	for n := range nodes {
+		rc, ok := snap[n]
+		assert(ok && n.rc.Load() == rc)
+	}
+}
+
+func diffDidPanic(f func()) (did bool) {
+	defer func() {
+		did = recover() != nil
+	}()
+	f()
+	return false
+}
+
+func TestMapDiffSameRoot(t *testing.T) {
+	// Multi-level tree so the walk has real branch frames to skip over.
+	var m Map[int, int]
+	N := 3000
+	for i := range N {
+		m.Set(i, i)
+	}
+	m2 := m.Clone()
+	assert(m.tree.root == m2.tree.root)
+
+	eqCalls := 0
+	eq := func(a, b int) bool {
+		eqCalls++
+		return a == b
+	}
+	recs, skips := runMapDiff(&m, m2, eq)
+	assert(len(recs) == 0)
+	assert(eqCalls == 0) // no item-level value comparison at all
+	assert(skips == 1)   // the shared root is skipped in a single step
+
+	// Diffing a map against itself behaves the same.
+	recs, skips = runMapDiff(&m, &m, eq)
+	assert(len(recs) == 0)
+	assert(eqCalls == 0)
+	assert(skips == 1)
+
+	// Two empty maps: no pieces, no comparisons, no skips.
+	var empty1, empty2 Map[int, int]
+	recs, skips = runMapDiff(&empty1, &empty2, eq)
+	assert(len(recs) == 0 && eqCalls == 0 && skips == 0)
+
+	// A zero-value receiver against a populated map is a pure insert stream.
+	recs, skips = runMapDiff(&empty1, &m, eq)
+	want := naiveMapDiff(&empty1, &m, eq)
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == N && skips == 0 && eqCalls == 0)
+
+	// A nil equality function is a programmer error, surfaced on iteration.
+	assert(diffDidPanic(func() {
+		for range m.Diff(m2, nil) {
+		}
+	}))
+}
+
+func TestMapDiffSingleModify(t *testing.T) {
+	var m Map[int, int]
+	N := 5000
+	for i := range N {
+		m.Set(i, i)
+	}
+	m2 := m.Clone()
+	key := 2500
+	old, replaced := m2.Set(key, -1)
+	assert(replaced && old == key)
+
+	eqCalls := 0
+	eq := func(a, b int) bool {
+		eqCalls++
+		return a == b
+	}
+	recs, skips := runMapDiff(&m, m2, eq)
+	// The oracle gets a non-counting wrapper so it cannot inflate eqCalls.
+	want := naiveMapDiff(&m, m2, func(a, b int) bool { return a == b })
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == 1)
+	assert(recs[0].key == key && recs[0].ch.Op == DiffModify)
+	assert(recs[0].ch.Old == key && recs[0].ch.New == -1)
+	// Only items held by the O(height) copied nodes on the modified path
+	// reach eq; every fully shared subtree is skipped wholesale.
+	assert(eqCalls >= 1)
+	assert(eqCalls <= (m.tree.Height()+1)*maxItems)
+	assert(eqCalls < N)
+	assert(skips > 0)
+
+	// The public iterator yields exactly the same records.
+	var pub []diffRec[int, int]
+	for k, ch := range m.Diff(m2, eq) {
+		pub = append(pub, diffRec[int, int]{k, ch})
+	}
+	assertDiffRecsEqual(pub, want)
+
+	// Small tree whose root is a leaf: every item is compared, one differs.
+	var small Map[int, int]
+	for i := range 4 {
+		small.Set(i, i)
+	}
+	small2 := small.Clone()
+	small2.Set(2, 20)
+	eqCalls = 0
+	recs, skips = runMapDiff(&small, small2, eq)
+	want = naiveMapDiff(&small, small2, func(a, b int) bool { return a == b })
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == 1 && recs[0].ch.Op == DiffModify)
+	assert(eqCalls == 4 && skips == 0)
+}
+
+func TestMapDiffInsertSplit(t *testing.T) {
+	// Fill a root leaf to capacity, then insert one more to force a split.
+	var m Map[int, int]
+	for i := range maxItems {
+		m.Set(i, i)
+	}
+	assert(m.tree.root.leaf())
+	m2 := m.Clone()
+	ins, inserted := m2.Insert(-1, -1)
+	assert(inserted && ins == 0)
+	assert(!m2.tree.root.leaf()) // the insertion split the root leaf
+
+	eqCalls := 0
+	eq := func(a, b int) bool {
+		eqCalls++
+		return a == b
+	}
+	recs, skips := runMapDiff(&m, m2, eq)
+	want := naiveMapDiff(&m, m2, func(a, b int) bool { return a == b })
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == 1 && recs[0].ch.Op == DiffInsert)
+	assert(recs[0].key == -1 && recs[0].ch.New == -1)
+	assert(eqCalls == maxItems)
+	assert(skips == 0) // splitting materializes fresh leaf nodes
+
+	// Bulk back inserts into a deep tree: most subtrees stay shared.
+	var big Map[int, int]
+	N := 4000
+	for i := range N {
+		big.Set(i, i)
+	}
+	big2 := big.Clone()
+	for i := range 120 {
+		big2.Set(N+i, N+i) // some of these trigger leaf and branch splits
+	}
+	big2.tree.Sane(nil)
+	eqCalls = 0
+	recs, skips = runMapDiff(&big, big2, eq)
+	want = naiveMapDiff(&big, big2, func(a, b int) bool { return a == b })
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == 120)
+	for _, r := range recs {
+		assert(r.ch.Op == DiffInsert)
+	}
+	assert(skips > 0)
+	assert(eqCalls < N) // untouched shared subtrees never reach eq
+}
+
+func TestMapDiffDeleteMerge(t *testing.T) {
+	var m Map[int, int]
+	N := 4000
+	for i := range N {
+		m.Set(i, i)
+	}
+	heightBefore := m.tree.Height()
+	m2 := m.Clone()
+	for i := range N {
+		if i%2 == 0 {
+			_, ok := m2.Delete(i)
+			assert(ok)
+		}
+	}
+	m2.tree.Sane(nil)
+	assert(m2.tree.Height() <= heightBefore) // deletes collapsed levels
+
+	eqCalls := 0
+	eq := func(a, b int) bool {
+		eqCalls++
+		return a == b
+	}
+	recs, _ := runMapDiff(&m, m2, eq)
+	want := naiveMapDiff(&m, m2, func(a, b int) bool { return a == b })
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == N/2)
+	for _, r := range recs {
+		assert(r.ch.Op == DiffDelete && r.ch.Old == r.key)
+	}
+
+	// Deleting everything drains through the emit-all path with no eq calls.
+	m3 := m.Clone()
+	for i := range N {
+		m3.Delete(i)
+	}
+	assert(m3.Len() == 0)
+	eqCalls = 0
+	recs, skips := runMapDiff(&m, m3, eq)
+	want = naiveMapDiff(&m, m3, func(a, b int) bool { return a == b })
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == N)
+	assert(eqCalls == 0 && skips == 0)
+
+	// Reversing the inputs reports the same keys as inserts.
+	recs, _ = runMapDiff(m3, &m, eq)
+	want = naiveMapDiff(m3, &m, func(a, b int) bool { return a == b })
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == N)
+	for _, r := range recs {
+		assert(r.ch.Op == DiffInsert && r.ch.New == r.key)
+	}
+}
+
+func TestMapDiffSharedSubtreeRelocated(t *testing.T) {
+	var m Map[int, int]
+	N := 4000
+	for i := range N {
+		m.Set(i, i)
+	}
+	m2 := m.Clone()
+	// Front inserts split the leftmost path and shift shared child pointers
+	// to different parent indices inside the copied branch nodes.
+	for i := 200; i >= 1; i-- {
+		m2.Set(-i, -i)
+	}
+	m2.tree.Sane(nil)
+
+	pathsOld := collectNodePaths(&m)
+	pathsNew := collectNodePaths(m2)
+	relocated := 0
+	for n, oldPaths := range pathsOld {
+		if n == m.tree.root {
+			continue
+		}
+		newPaths, ok := pathsNew[n]
+		if !ok {
+			continue
+		}
+		for _, op := range oldPaths {
+			for _, np := range newPaths {
+				if !slices.Equal(op, np) {
+					relocated++
+				}
+			}
+		}
+	}
+	assert(relocated > 0) // the scenario really relocates shared nodes
+
+	eqCalls := 0
+	eq := func(a, b int) bool {
+		eqCalls++
+		return a == b
+	}
+	recs, skips := runMapDiff(&m, m2, eq)
+	want := naiveMapDiff(&m, m2, eq)
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == 200) // pure front inserts, nothing else differs
+	assert(skips > 0)        // range alignment still recognizes shared subtrees
+}
+
+func TestMapDiffIndependentTrees(t *testing.T) {
+	N := 1500
+	build := func(order []int) *Map[int, int] {
+		m := NewMap[int, int]()
+		for _, i := range order {
+			m.Set(i, i)
+		}
+		return m
+	}
+	order := make([]int, N)
+	for i := range N {
+		order[i] = i
+	}
+	a := build(order)
+	bSame := build(order)
+
+	// Independently built trees share no node identity.
+	nodesA := collectMapNodes(a)
+	for n := range collectMapNodes(bSame) {
+		assert(!nodesA[n])
+	}
+
+	eqCalls := 0
+	eq := func(a, b int) bool {
+		eqCalls++
+		return a == b
+	}
+	recs, skips := runMapDiff(a, bSame, eq)
+	assert(len(recs) == 0)
+	assert(skips == 0)
+	assert(eqCalls == N) // linear merge compares every common key
+
+	// A different insertion order may reshape the tree; output must match.
+	rng := rand.New(rand.NewPCG(1, 2))
+	bPerm := build(rng.Perm(N))
+	eqCalls = 0
+	recs, skips = runMapDiff(a, bPerm, eq)
+	assert(len(recs) == 0 && skips == 0 && eqCalls == N)
+
+	// One changed value surfaces as exactly one modify record.
+	bPerm.Set(N/2, -1)
+	eqCalls = 0
+	recs, _ = runMapDiff(a, bPerm, eq)
+	want := naiveMapDiff(a, bPerm, func(x, y int) bool { return x == y })
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == 1 && recs[0].ch.Op == DiffModify)
+	assert(eqCalls == N)
+
+	// String-key maps cover both the prefix and no-prefix node layouts.
+	for _, nopre := range []bool{false, true} {
+		mk := func() *Map[string, int] {
+			return NewMapOptions(MapOptions[string, int]{NoPrefix: nopre})
+		}
+		s1, s2 := mk(), mk()
+		for i := range 500 {
+			k := itoa(i)
+			s1.Set(k, i)
+			s2.Set(k, i)
+		}
+		sCalls := 0
+		sEq := func(a, b int) bool {
+			sCalls++
+			return a == b
+		}
+		sRecs, sSkips := runMapDiff(s1, s2, sEq)
+		sWant := naiveMapDiff(s1, s2, func(x, y int) bool { return x == y })
+		assertDiffRecsEqual(sRecs, sWant)
+		assert(len(sRecs) == 0 && sSkips == 0 && sCalls == 500)
+	}
+}
+
+type diffBox struct{ n int }
+
+func TestMapDiffPointerValuesAndEarlyStop(t *testing.T) {
+	N := 100
+	var a Map[int, *diffBox]
+	b := NewMap[int, *diffBox]()
+	for i := range N {
+		a.Set(i, &diffBox{n: i})
+		b.Set(i, &diffBox{n: i}) // fresh allocations, equal contents
+	}
+	eqCalls := 0
+	eq := func(x, y *diffBox) bool {
+		eqCalls++
+		return x.n == y.n
+	}
+	recs, skips := runMapDiff(&a, b, eq)
+	assert(len(recs) == 0) // equal per callback despite distinct pointers
+	assert(skips == 0)
+	assert(eqCalls == N)
+
+	// One content change: every pointer differs, only one key is a modify.
+	oldB, _ := b.Lookup(42)
+	b.Set(42, &diffBox{n: 4242})
+	eqCalls = 0
+	recs, _ = runMapDiff(&a, b, eq)
+	assert(len(recs) == 1)
+	assert(recs[0].key == 42 && recs[0].ch.Op == DiffModify)
+	assert(recs[0].ch.Old == a.Get(42))
+	assert(recs[0].ch.New != oldB && recs[0].ch.New.n == 4242)
+
+	// Early stop: a false return halts the walk with no further eq calls.
+	var c Map[int, int]
+	d := NewMap[int, int]()
+	for i := range 100 {
+		c.Set(i, i)
+	}
+	for i := 50; i < 150; i++ {
+		d.Set(i, i)
+	}
+	intEqCalls := 0
+	intEq := func(x, y int) bool {
+		intEqCalls++
+		return x == y
+	}
+	want := naiveMapDiff(&c, d, intEq)
+	intEqCalls = 0
+	var got []diffRec[int, int]
+	callsAtStop := -1
+	mapDiffRun(&c.tree, &d.tree, intEq,
+		func(k int, ch DiffChange[int]) bool {
+			got = append(got, diffRec[int, int]{k, ch})
+			if len(got) == 3 {
+				callsAtStop = intEqCalls
+				return false
+			}
+			return true
+		})
+	assert(len(got) == 3)
+	assert(intEqCalls == callsAtStop) // eq is never invoked after the false return
+	assertDiffRecsEqual(got, want[:3])
+
+	// The public iterator honors break as well, including the emit-all path.
+	var empty Map[int, int]
+	count := 0
+	for range c.Diff(&empty, intEq) {
+		count++
+		if count == 5 {
+			break
+		}
+	}
+	assert(count == 5)
+
+	// A false return on the insert side (empty old map) unwinds at once.
+	insertStops := 0
+	mapDiffRun(&empty.tree, &c.tree, intEq,
+		func(int, DiffChange[int]) bool {
+			insertStops++
+			return false
+		})
+	assert(insertStops == 1)
+
+	// Same guarantee for an insert yielded mid-merge while both cursors are
+	// active: the very first new-side key sorts before every old-side key.
+	var lo, hi Map[int, int]
+	for i := range 4 {
+		lo.Set(i, i)
+		hi.Set(10+i, 10+i)
+	}
+	insertMid := 0
+	mapDiffRun(&hi.tree, &lo.tree, intEq,
+		func(int, DiffChange[int]) bool {
+			insertMid++
+			return false
+		})
+	assert(insertMid == 1)
+}
+
+func TestMapDiffZeroValues(t *testing.T) {
+	a := NewMap[string, int]()
+	b := NewMap[string, int]()
+	a.Set("a", 0)
+	a.Set("b", 0)
+	a.Set("c", 5)
+	b.Set("a", 0)
+	b.Set("b", 1)
+	b.Set("d", 0)
+	eq := func(x, y int) bool { return x == y }
+	recs, _ := runMapDiff(a, b, eq)
+	want := naiveMapDiff(a, b, eq)
+	assertDiffRecsEqual(recs, want)
+	assert(len(recs) == 3)
+	// b: modify whose old value is the zero value.
+	assert(recs[0].key == "b" && recs[0].ch.Op == DiffModify)
+	assert(recs[0].ch.Old == 0 && recs[0].ch.New == 1)
+	// c: delete carrying a non-zero value.
+	assert(recs[1].key == "c" && recs[1].ch.Op == DiffDelete)
+	assert(recs[1].ch.Old == 5 && recs[1].ch.New == 0)
+	// d: insert whose new value is the zero value, still an explicit insert.
+	assert(recs[2].key == "d" && recs[2].ch.Op == DiffInsert)
+	assert(recs[2].ch.Old == 0 && recs[2].ch.New == 0)
+}
+
+func TestMapDiffNoCOWSideEffects(t *testing.T) {
+	var copies, releases atomic.Int64
+	m := NewMapOptions(MapOptions[int, int]{
+		Copy:    func(v int) int { copies.Add(1); return v },
+		Release: func(int) { releases.Add(1) },
+	})
+	N := 2000
+	for i := range N {
+		m.Set(i, i)
+	}
+	m2 := m.Clone()
+	for i := 0; i < 50; i++ {
+		m2.Set(i*7, -i) // establish a baseline of COW node copies/releases
+	}
+	m2.tree.Sane(nil)
+
+	keysBefore := slices.Collect(m.Keys())
+	keys2Before := slices.Collect(m2.Keys())
+	valsBefore := slices.Collect(m.Values())
+	vals2Before := slices.Collect(m2.Values())
+	rcOld := snapshotNodeRC(m)
+	rcNew := snapshotNodeRC(m2)
+	copyBase := copies.Load()
+	releaseBase := releases.Load()
+
+	eq := func(a, b int) bool { return a == b }
+	recs, _ := runMapDiff(m, m2, eq)
+	assert(len(recs) > 0)
+	// An early-stopped walk must be side-effect free as well.
+	mapDiffRun(&m.tree, &m2.tree, eq, func(int, DiffChange[int]) bool {
+		return false
+	})
+
+	assert(copies.Load() == copyBase)
+	assert(releases.Load() == releaseBase)
+	assertRCSnapshot(m, rcOld)
+	assertRCSnapshot(m2, rcNew)
+	assert(slices.Equal(slices.Collect(m.Keys()), keysBefore))
+	assert(slices.Equal(slices.Collect(m2.Keys()), keys2Before))
+	assert(slices.Equal(slices.Collect(m.Values()), valsBefore))
+	assert(slices.Equal(slices.Collect(m2.Values()), vals2Before))
+}
+
+func TestMapDiffRandomized(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed: %d", seed)
+	rng := rand.New(rand.NewPCG(seed, seed))
+	for range 200 {
+		n := rng.IntN(1600)
+		const universe = 2000
+		base := NewMap[int, int]()
+		goMap := make(map[int]int)
+		for range n {
+			k := rng.IntN(universe)
+			if _, ok := goMap[k]; !ok {
+				v := rng.IntN(100)
+				goMap[k] = v
+				base.Set(k, v)
+			}
+		}
+		// Occasionally use a coarser equality so some value changes suppress
+		// modify records; the oracle always uses the same rule.
+		modEq := rng.IntN(2) == 0
+		eq := func(a, b int) bool {
+			if modEq {
+				return a%7 == b%7
+			}
+			return a == b
+		}
+		independent := rng.IntN(2) == 0
+		var other *Map[int, int]
+		if independent {
+			other = NewMap[int, int]()
+			for k, v := range goMap {
+				if rng.IntN(2) == 0 {
+					other.Set(k, v)
+				}
+			}
+		} else {
+			other = base.Clone()
+		}
+		for range rng.IntN(200) {
+			k := rng.IntN(universe)
+			if rng.IntN(3) == 0 {
+				other.Delete(k)
+			} else {
+				other.Set(k, rng.IntN(100))
+			}
+		}
+		eqCalls := 0
+		countedEq := func(a, b int) bool {
+			eqCalls++
+			return eq(a, b)
+		}
+		recs, skips := runMapDiff(base, other, countedEq)
+		want := naiveMapDiff(base, other, eq)
+		assertDiffRecsEqual(recs, want)
+
+		common := 0
+		for k := range goMap {
+			if _, ok := other.Lookup(k); ok {
+				common++
+			}
+		}
+		assert(eqCalls <= common) // skipped shared keys never reach eq
+		if independent {
+			assert(skips == 0)
+		}
+		if base.tree.root == other.tree.root {
+			// Untouched clone: one root skip, zero comparisons, zero records.
+			assert(eqCalls == 0 && skips == 1 && len(recs) == 0)
+		}
+		base.tree.Sane(nil)
+		other.tree.Sane(nil)
+	}
+}
+
+func TestMapDiffStringRandomized(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed: %d", seed)
+	rng := rand.New(rand.NewPCG(seed, seed))
+	for _, nopre := range []bool{false, true} {
+		mk := func() *Map[string, int] {
+			return NewMapOptions(MapOptions[string, int]{NoPrefix: nopre})
+		}
+		a, b := mk(), mk()
+		for range 1000 {
+			k := itoa(rng.IntN(1500))
+			a.Set(k, rng.IntN(100))
+		}
+		for k, v := range a.All() {
+			b.Set(k, v)
+		}
+		for range 300 {
+			k := itoa(rng.IntN(1500))
+			if rng.IntN(3) == 0 {
+				b.Delete(k)
+			} else {
+				b.Set(k, rng.IntN(100))
+			}
+		}
+		eq := func(x, y int) bool { return x == y }
+		recs, _ := runMapDiff(a, b, eq)
+		want := naiveMapDiff(a, b, eq)
+		assertDiffRecsEqual(recs, want)
+		a.tree.Sane(func(k string, v int) bool { return k == "" && v == 0 })
+		b.tree.Sane(func(k string, v int) bool { return k == "" && v == 0 })
+	}
+}

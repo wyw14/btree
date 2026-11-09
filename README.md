@@ -99,6 +99,9 @@ DrainAt(i, count)       # Remove and extract items starting at index.
 Action(key, actfunc)    # Perform action (replace/delete) using custom function
 DeleteFunc(delfunc)     # Delete item using custom function
 
+Diff(other, eq)         # Iterate key differences in key order.       (iter.Seq2[K,DiffChange[V]])
+                        #   eq compares values; skips shared clone subtrees
+
 Len()                   # Get the number of items in map.
 Clone()                 # Clone map, fast O(1), uses copy-on-write shadow cloning.
 Clear()                 # Remove all items from map
