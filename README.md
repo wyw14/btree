@@ -57,6 +57,7 @@ The keys adhere to the parameter type [`cmp.Ordered`](https://pkg.go.dev/cmp#Ord
 ### Operations
 
 ```py
+NewMapOrderedSeq(n, seq) # Bulk-build a map from a strictly increasing, unique iter.Seq2 of n items.
 Insert(key, val)        # Insert an item. (does not replace if already exists)
 Replace(key, val)       # Replace an existing item. (does not insert if not exists)
 Set(key, val)           # Insert or replace an item.

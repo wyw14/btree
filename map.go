@@ -8,6 +8,7 @@ package btree
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"iter"
 	"unsafe"
@@ -1199,4 +1200,287 @@ func (b *Map[K, V]) altLookupMut(key K) (V, bool) {
 		var emptyValue V
 		return b.tree.LookupMut(key, emptyValue)
 	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Ordered bulk construction
+////////////////////////////////////////////////////////////////////////////////
+
+// Sentinel errors wrapped by *OrderedSeqError.
+var (
+	// ErrOrderedSeqCountMismatch is returned when the number of items
+	// yielded by an ordered sequence does not match the declared count.
+	ErrOrderedSeqCountMismatch = errors.New(
+		"btree: ordered sequence count mismatch")
+	// ErrOrderedSeqOutOfOrder is returned when an ordered sequence yields
+	// a key that is not greater than the previous key.
+	ErrOrderedSeqOutOfOrder = errors.New(
+		"btree: ordered sequence out of order")
+	// ErrOrderedSeqDuplicateKey is returned when an ordered sequence
+	// yields a key that is equal to the previous key.
+	ErrOrderedSeqDuplicateKey = errors.New(
+		"btree: ordered sequence duplicate key")
+)
+
+// OrderedSeqError is returned by NewMapOrderedSeq when the input sequence
+// fails validation. Index is the zero-based position, within the input
+// sequence, of the item that triggered the failure. For a short sequence
+// the index is the position of the first missing item; for a long sequence
+// it is the position of the first unexpected item.
+type OrderedSeqError struct {
+	Index int
+	err   error
+}
+
+func (e *OrderedSeqError) Error() string {
+	return fmt.Sprintf("%s (index %d)", e.err.Error(), e.Index)
+}
+
+// Unwrap returns the wrapped sentinel error, which is one of
+// ErrOrderedSeqCountMismatch, ErrOrderedSeqOutOfOrder or
+// ErrOrderedSeqDuplicateKey.
+func (e *OrderedSeqError) Unwrap() error {
+	return e.err
+}
+
+// bulkLoadStats reports counters collected while bulk-loading a tree.
+type bulkLoadStats struct {
+	compares int // key comparisons performed for order validation
+	nodes    int // tree nodes allocated during the load
+}
+
+// orderedSeqBuilder consumes an ordered sequence and arranges the items
+// directly into a valid b-tree, bottom up. Apart from the final nodes it
+// only keeps O(height) recursion state plus one node per open level, which
+// is bounded by O(fanout*height). No item is ever copied into a slice.
+type orderedSeqBuilder[K cmp.Ordered, V any] struct {
+	t        *tree[K, V]
+	next     func() (K, V, bool)
+	prevKey  K
+	prevVal  V
+	hasPrev  bool
+	consumed int
+	stats    bulkLoadStats
+}
+
+// bulkCapMax returns the maximum number of items held by a subtree of the
+// given height. Height 0 is a single leaf node.
+func bulkCapMax(height int) uint64 {
+	c := uint64(maxItems)
+	for range height {
+		c = uint64(maxItems+1)*c + uint64(maxItems)
+	}
+	return c
+}
+
+// bulkCapMin returns the minimum number of items allowed in a non-root
+// subtree of the given height.
+func bulkCapMin(height int) uint64 {
+	c := uint64(minItems)
+	for range height {
+		c = uint64(minItems+1)*c + uint64(minItems)
+	}
+	return c
+}
+
+// bulkHeight returns the smallest tree height that can hold n items.
+func bulkHeight(n int) int {
+	un := uint64(n)
+	h := 0
+	for un > bulkCapMax(h) {
+		h++
+	}
+	return h
+}
+
+// consume pulls the next item from the sequence and validates that its key
+// is strictly greater than the previously consumed one. Each adjacent pair
+// costs exactly one comparison, so the total is linear in the item count.
+func (b *orderedSeqBuilder[K, V]) consume() (K, V, error) {
+	key, value, ok := b.next()
+	if !ok {
+		var emptyKey K
+		var emptyValue V
+		return emptyKey, emptyValue, &OrderedSeqError{
+			Index: b.consumed,
+			err:   ErrOrderedSeqCountMismatch,
+		}
+	}
+	index := b.consumed
+	b.consumed++
+	if b.hasPrev {
+		b.stats.compares++
+		c := b.t.dataCompare(b.prevKey, b.prevVal, key, value)
+		if c == 0 {
+			return key, value, &OrderedSeqError{
+				Index: index,
+				err:   ErrOrderedSeqDuplicateKey,
+			}
+		}
+		if c > 0 {
+			return key, value, &OrderedSeqError{
+				Index: index,
+				err:   ErrOrderedSeqOutOfOrder,
+			}
+		}
+	}
+	b.prevKey, b.prevVal = key, value
+	b.hasPrev = true
+	return key, value, nil
+}
+
+// build recursively creates a subtree of the given height holding exactly
+// count items. Root subtrees may use as few as two children; every other
+// branch uses between minItems+1 and maxItems+1 children, so every non-root
+// node meets the minItems/maxItems invariants as soon as it is created.
+func (b *orderedSeqBuilder[K, V]) build(height, count int, root bool,
+) (*node[K, V], error) {
+	if height == 0 {
+		n := b.t.newNode(true)
+		b.stats.nodes++
+		for i := 0; i < count; i++ {
+			key, value, err := b.consume()
+			if err != nil {
+				return nil, err
+			}
+			n.keys[i] = key
+			n.values[i] = value
+		}
+		n.len = count
+		return n, nil
+	}
+	minChildren := minItems + 1
+	if root {
+		minChildren = 2
+	}
+	childCapMax := bulkCapMax(height - 1)
+	// Smallest child count able to hold count items: k child subtrees hold
+	// count-(k-1) items once the k-1 separator items are accounted for.
+	k := int((uint64(count) + 1) / (childCapMax + 1))
+	if (uint64(count)+1)%(childCapMax+1) != 0 {
+		k++
+	}
+	if k < minChildren {
+		k = minChildren
+	}
+	n := b.t.newNode(false)
+	b.stats.nodes++
+	childCapMin := bulkCapMin(height - 1)
+	remaining := count - (k - 1)
+	for i := 0; i < k; i++ {
+		// Reserve the minimum capacity for every child still to build.
+		left := k - i - 1
+		size := remaining - left*int(childCapMin)
+		if max := int(childCapMax); size > max {
+			size = max
+		}
+		remaining -= size
+		child, err := b.build(height-1, size, false)
+		if err != nil {
+			return nil, err
+		}
+		n.branch.children[i] = child
+		n.branch.counts[i] = size
+		if i < k-1 {
+			// Each separator is an actual input item, never a copy.
+			key, value, err := b.consume()
+			if err != nil {
+				return nil, err
+			}
+			n.keys[i] = key
+			n.values[i] = value
+			if n.branch.prefixes != nil {
+				n.branch.prefixes[i] = prefixString(key)
+			}
+		}
+	}
+	n.len = k - 1
+	return n, nil
+}
+
+// loadOrdered builds the tree behind a Map from a one-shot ordered
+// sequence. The tree root is assigned only after the whole sequence has
+// been validated, so a failure never leaves a half-valid tree behind.
+func (b *Map[K, V]) loadOrdered(n int, seq iter.Seq2[K, V],
+) (bulkLoadStats, error) {
+	b.init()
+	var stats bulkLoadStats
+	if n < 0 || seq == nil {
+		return stats, &OrderedSeqError{
+			Index: 0,
+			err:   ErrOrderedSeqCountMismatch,
+		}
+	}
+	next, stop := iter.Pull2(seq)
+	defer stop()
+	if n == 0 {
+		if _, _, ok := next(); ok {
+			return stats, &OrderedSeqError{
+				Index: 0,
+				err:   ErrOrderedSeqCountMismatch,
+			}
+		}
+		return stats, nil
+	}
+	bd := &orderedSeqBuilder[K, V]{t: &b.tree, next: next}
+	root, err := bd.build(bulkHeight(n), n, true)
+	if err != nil {
+		return bd.stats, err
+	}
+	// The sequence must yield exactly n items.
+	if _, _, ok := next(); ok {
+		return bd.stats, &OrderedSeqError{
+			Index: n,
+			err:   ErrOrderedSeqCountMismatch,
+		}
+	}
+	b.tree.root = root
+	b.tree.count = n
+	return bd.stats, nil
+}
+
+// NewMapOrderedSeq returns a new Map built in a single pass from an ordered
+// iter.Seq2 sequence.
+//
+// The sequence must yield exactly n key/value pairs, with strictly
+// increasing, unique keys. Ordering and key equality follow the same
+// comparison semantics used by every other Map operation, namely
+// cmp.Compare on keys. The sequence is traversed at most once and items are
+// placed directly into the final b-tree nodes; the input is never collected
+// into an intermediate slice before being arranged.
+//
+// The tree is assembled bottom up: leaves, separator items and branches are
+// created in their final positions so that every non-root node immediately
+// satisfies minItems/maxItems, all leaves share one depth, and branch counts
+// and string prefixes are correct from the start. Besides the final nodes,
+// construction state is bounded by O(fanout*height), and order validation
+// performs one comparison per adjacent pair of items.
+//
+// A validation failure returns an *OrderedSeqError wrapping one of
+// ErrOrderedSeqCountMismatch, ErrOrderedSeqOutOfOrder or
+// ErrOrderedSeqDuplicateKey, with the error Index set to the zero-based
+// position of the offending input item. On failure no map is returned and
+// the partially built nodes are discarded without invoking the Release
+// callback: input values remain owned by the caller and ownership of every
+// value transfers to the new Map only after the whole sequence has been
+// delivered successfully. As with ordinary inserts, values are stored as
+// delivered and the Copy callback is only used later by copy-on-write
+// operations.
+//
+// The Copy and Release callbacks supplied through opts must not panic. A
+// panicking callback may leave external side effects behind, and this
+// package does not attempt to detect or recover such side effects.
+func NewMapOrderedSeq[K cmp.Ordered, V any](opts MapOptions[K, V], n int,
+	seq iter.Seq2[K, V],
+) (*Map[K, V], error) {
+	b := NewMapOptions(opts)
+	if _, err := b.loadOrdered(n, seq); err != nil {
+		// loadOrdered only attaches a root after a fully validated run, so
+		// there is nothing to release: partial nodes are abandoned to the
+		// garbage collector and every value still belongs to the caller.
+		b.tree.root = nil
+		b.tree.count = 0
+		return nil, err
+	}
+	return b, nil
 }

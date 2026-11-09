@@ -9,6 +9,7 @@ package btree
 import (
 	"bytes"
 	"cmp"
+	"errors"
 	"fmt"
 	"iter"
 	"maps"
@@ -4918,4 +4919,561 @@ func TestMapStringKey3(t *testing.T) {
 		assert(v == "")
 	}
 	assert(m.Len() == N)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Ordered bulk construction
+////////////////////////////////////////////////////////////////////////////////
+
+// intSeq2 yields n pairs (i, -i) without keeping any item slice behind:
+// the only state is the loop counter.
+func intSeq2(n int) iter.Seq2[int, int] {
+	return func(yield func(int, int) bool) {
+		for i := 0; i < n; i++ {
+			if !yield(i, -i) {
+				return
+			}
+		}
+	}
+}
+
+// mutatedIntSeq2 yields n pairs whose key is mut(i).
+func mutatedIntSeq2(n int, mut func(i int) int) iter.Seq2[int, int] {
+	return func(yield func(int, int) bool) {
+		for i := 0; i < n; i++ {
+			key := mut(i)
+			if !yield(key, -key) {
+				return
+			}
+		}
+	}
+}
+
+func countBulkNodes[K, V any](n *node[K, V]) int {
+	if n == nil {
+		return 0
+	}
+	c := 1
+	if !n.leaf() {
+		for i := 0; i <= n.len; i++ {
+			c += countBulkNodes(n.branch.children[i])
+		}
+	}
+	return c
+}
+
+// bulkCheckShape enforces the structural promises of the bulk loader:
+// non-root nodes stay within minItems/maxItems, unused child slots are nil,
+// and every leaf sits at the same depth.
+func bulkCheckShape[K, V any](n *node[K, V], depth, height int) {
+	if n == nil {
+		return
+	}
+	assert(n.len <= maxItems)
+	if depth > 0 {
+		assert(n.len >= minItems)
+	}
+	if n.leaf() {
+		assert(depth == height)
+		return
+	}
+	assert(n.len >= 1)
+	for i := 0; i <= n.len; i++ {
+		bulkCheckShape(n.branch.children[i], depth+1, height)
+	}
+	for i := n.len + 1; i <= maxItems; i++ {
+		assert(n.branch.children[i] == nil)
+	}
+}
+
+func TestMapOrderedSeq(t *testing.T) {
+	sizes := []int{
+		0, 1, 2, 3,
+		minItems - 1, minItems, minItems + 1,
+		maxItems - 1, maxItems, maxItems + 1, maxItems + 2,
+		2 * minItems, 2*minItems + 1,
+		// two-level height boundary (height 1 -> 2)
+		int(bulkCapMax(1)) - 1, int(bulkCapMax(1)), int(bulkCapMax(1)) + 1,
+		// three-level height boundary (height 2 -> 3)
+		int(bulkCapMax(2)) - 1, int(bulkCapMax(2)), int(bulkCapMax(2)) + 1,
+	}
+	isempty := func(k, v int) bool {
+		return k == 0 && v == 0
+	}
+	for _, n := range sizes {
+		// Internal entry also exposes the construction counters.
+		b := NewMap[int, int]()
+		stats, err := b.loadOrdered(n, intSeq2(n))
+		assert(err == nil)
+		assert(b.Len() == n)
+		assert(b.tree.Height() == bulkHeight(n))
+		b.tree.Sane(isempty)
+		bulkCheckShape(b.tree.root, 0, bulkHeight(n))
+
+		// Exactly one comparison per adjacent pair, and every allocated
+		// node is part of the final tree (no hidden O(n) scratch nodes).
+		wantCompares := n - 1
+		if wantCompares < 0 {
+			wantCompares = 0
+		}
+		assert(stats.compares == wantCompares)
+		assert(stats.nodes == countBulkNodes(b.tree.root))
+
+		// Forward and backward content, random access and index lookup.
+		var i int
+		for key, value := range b.All() {
+			assert(key == i && value == -i)
+			i++
+		}
+		assert(i == n)
+		i = n
+		for key, value := range b.Backward() {
+			i--
+			assert(key == i && value == -i)
+		}
+		assert(i == 0)
+		for j := 0; j < n; j++ {
+			key, value := b.GetAt(j)
+			assert(key == j && value == -j)
+			idx, found := b.IndexOf(j)
+			assert(found && idx == j)
+			v, found := b.Lookup(j)
+			assert(found && v == -j)
+		}
+		_, found := b.IndexOf(n)
+		assert(!found)
+
+		// The bulk-loaded content matches a conventionally inserted map.
+		var ref Map[int, int]
+		for j := 0; j < n; j++ {
+			ref.Insert(j, -j)
+		}
+		assert(slices.Equal(slices.Collect(b.Keys()),
+			slices.Collect(ref.Keys())))
+		assert(slices.Equal(slices.Collect(b.Values()),
+			slices.Collect(ref.Values())))
+
+		// Clone stays sane and independent.
+		c := b.Clone()
+		c.tree.Sane(isempty)
+		assert(c.Len() == n)
+		if n > 0 {
+			c.Set(0, -1)
+			c.Insert(n, -n)
+			c.tree.Sane(isempty)
+			assert(c.Len() == n+1)
+			_, stillThere := b.Lookup(0)
+			assert(stillThere && b.Get(0) == 0)
+			_, inClone := c.Lookup(n)
+			assert(inClone)
+			_, inOriginal := b.Lookup(n)
+			assert(!inOriginal)
+		}
+
+		// Drain empties the map and returns ordered items.
+		d := NewMap[int, int]()
+		_, err = d.loadOrdered(n, intSeq2(n))
+		assert(err == nil)
+		ex := d.DrainAt(0, n)
+		assert(ex.Len() == n)
+		if n > 0 {
+			j := 0
+			for key, value := range ex.All() {
+				assert(key == j && value == -j)
+				j++
+			}
+			assert(j == n)
+		}
+		assert(d.Len() == 0)
+		d.tree.Sane(isempty)
+
+		// Ordinary writes keep working on top of a bulk-loaded tree.
+		if n > 0 {
+			bw := NewMap[int, int]()
+			_, err := bw.loadOrdered(n, intSeq2(n))
+			assert(err == nil)
+			_, inserted := bw.Insert(n, -n)
+			assert(inserted)
+			_, deleted := bw.Delete(0)
+			assert(deleted)
+			bw.tree.Sane(isempty)
+			assert(bw.Len() == n)
+		}
+	}
+
+	// Comparison counts grow linearly with n (no wall-clock thresholds).
+	for _, base := range []int{1000, 10000, 100000} {
+		var b1, b2 Map[int, int]
+		s1, err := b1.loadOrdered(base, intSeq2(base))
+		assert(err == nil)
+		s2, err := b2.loadOrdered(base*2, intSeq2(base*2))
+		assert(err == nil)
+		assert(s1.compares == base-1)
+		assert(s2.compares == 2*base-1)
+		assert(s2.compares == 2*s1.compares+1)
+		b1.tree.Sane(nil)
+		b2.tree.Sane(nil)
+	}
+}
+
+func TestMapOrderedSeqErrors(t *testing.T) {
+	checkErr := func(err error, index int, sentinel error) {
+		assert(err != nil)
+		var oe *OrderedSeqError
+		assert(errors.As(err, &oe))
+		assert(oe.Index == index)
+		assert(errors.Is(err, sentinel))
+		assert(strings.Contains(err.Error(), strconv.Itoa(index)))
+	}
+
+	// Declared more items than delivered.
+	m, err := NewMapOrderedSeq(MapOptions[int, int]{}, 100, intSeq2(50))
+	assert(m == nil)
+	checkErr(err, 50, ErrOrderedSeqCountMismatch)
+
+	// Declared fewer items than delivered: the first extra item is at n.
+	m, err = NewMapOrderedSeq(MapOptions[int, int]{}, 100, intSeq2(101))
+	assert(m == nil)
+	checkErr(err, 100, ErrOrderedSeqCountMismatch)
+
+	// Empty map declared but the sequence yields something.
+	m, err = NewMapOrderedSeq(MapOptions[int, int]{}, 0, intSeq2(1))
+	assert(m == nil)
+	checkErr(err, 0, ErrOrderedSeqCountMismatch)
+
+	// Negative declared count and nil sequence.
+	m, err = NewMapOrderedSeq(MapOptions[int, int]{}, -1, intSeq2(0))
+	assert(m == nil)
+	checkErr(err, 0, ErrOrderedSeqCountMismatch)
+	m, err = NewMapOrderedSeq(MapOptions[int, int]{}, 10, nil)
+	assert(m == nil)
+	checkErr(err, 0, ErrOrderedSeqCountMismatch)
+
+	// Duplicate key: item 10 repeats the key of item 9.
+	m, err = NewMapOrderedSeq(MapOptions[int, int]{}, 100,
+		mutatedIntSeq2(100, func(i int) int {
+			if i == 10 {
+				return 9
+			}
+			return i
+		}))
+	assert(m == nil)
+	checkErr(err, 10, ErrOrderedSeqDuplicateKey)
+
+	// Out-of-order key, including a value that differs to prove only keys
+	// participate in the comparison.
+	m, err = NewMapOrderedSeq(MapOptions[int, int]{}, 100,
+		mutatedIntSeq2(100, func(i int) int {
+			if i == 10 {
+				return 5
+			}
+			return i
+		}))
+	assert(m == nil)
+	checkErr(err, 10, ErrOrderedSeqOutOfOrder)
+
+	// A failure deep in a multi-level tree reports the exact input index.
+	m, err = NewMapOrderedSeq(MapOptions[int, int]{}, 5000,
+		mutatedIntSeq2(5000, func(i int) int {
+			if i == 4321 {
+				return 42
+			}
+			return i
+		}))
+	assert(m == nil)
+	checkErr(err, 4321, ErrOrderedSeqOutOfOrder)
+
+	// A successful empty load is still usable afterwards.
+	m, err = NewMapOrderedSeq(MapOptions[int, int]{}, 0, intSeq2(0))
+	assert(err == nil && m != nil)
+	assert(m.Len() == 0)
+	m.tree.Sane(nil)
+	_, inserted := m.Insert(1, -1)
+	assert(inserted)
+	m.tree.Sane(nil)
+}
+
+func TestMapOrderedSeqOwnership(t *testing.T) {
+	// Mirror the accounting model of TestMapCOWDataRelease: every value the
+	// caller owns counts once, Copy adds one, Release removes one.
+	values := make(map[string]int)
+	addValue := func(value string) { values[value]++ }
+	delValue := func(value string) { values[value]-- }
+	opts := MapOptions[int, string]{
+		Copy: func(value string) string {
+			addValue(value)
+			return value
+		},
+		Release: func(value string) {
+			delValue(value)
+		},
+	}
+	n := 5000
+	seq := func(yield func(int, string) bool) {
+		for i := 0; i < n; i++ {
+			value := strconv.Itoa(i)
+			addValue(value) // caller owns the value before delivery
+			if !yield(i, value) {
+				return
+			}
+		}
+	}
+	m, err := NewMapOrderedSeq(opts, n, seq)
+	assert(err == nil)
+	m.tree.Sane(func(k int, v string) bool { return k == 0 && v == "" })
+	// A successful load stores values as delivered: no Copy, no Release.
+	assert(len(values) == n)
+	for _, c := range values {
+		assert(c == 1)
+	}
+
+	// Copy-on-write after the fact goes through the Copy callback, and the
+	// original bulk-loaded map keeps its own values. Replacing with the same
+	// value keeps the external accounting closed: every value entering the
+	// tree has a matching add, every released value a matching del.
+	m2 := m.Clone()
+	for i := 0; i < 50; i++ {
+		key := i * 100
+		value := strconv.Itoa(key)
+		old, replaced := m2.Set(key, value)
+		assert(replaced && old == value)
+	}
+	m.tree.Sane(nil)
+	m2.tree.Sane(nil)
+	m.Release()
+	assert(m.Len() == 0)
+	m2.Release()
+	assert(m2.Len() == 0)
+	for _, c := range values {
+		assert(c == 0)
+	}
+
+	// On validation failure the map never takes ownership: no Copy and no
+	// Release calls happen, every delivered caller value stays accounted
+	// for, and no half-valid map escapes. A fresh ledger keeps this phase
+	// independent of the one above.
+	failedValues := make(map[string]int)
+	failedAdd := func(value string) { failedValues[value]++ }
+	failedDel := func(value string) { failedValues[value]-- }
+	failedOpts := MapOptions[int, string]{
+		Copy: func(value string) string {
+			failedAdd(value)
+			return value
+		},
+		Release: func(value string) {
+			failedDel(value)
+		},
+	}
+	badSeq := func(yield func(int, string) bool) {
+		for i := 0; i < n; i++ {
+			key := i
+			if i == 100 {
+				key = 50 // strictly smaller than the previous key 99
+			}
+			value := strconv.Itoa(i)
+			failedAdd(value)
+			if !yield(key, value) {
+				return
+			}
+		}
+	}
+	failed, err := NewMapOrderedSeq(failedOpts, n, badSeq)
+	assert(failed == nil)
+	var oe *OrderedSeqError
+	assert(errors.As(err, &oe) && oe.Index == 100)
+	assert(errors.Is(err, ErrOrderedSeqOutOfOrder))
+	// The failing item plus its 100 predecessors were delivered; none of
+	// them were copied or released, and no other value was touched.
+	assert(len(failedValues) == 101)
+	for _, c := range failedValues {
+		assert(c == 1)
+	}
+	// The caller still owns every delivered value and disposes of them.
+	for i := 0; i <= 100; i++ {
+		failedDel(strconv.Itoa(i))
+	}
+	for _, c := range failedValues {
+		assert(c == 0)
+	}
+}
+
+func TestMapOrderedSeqSinglePass(t *testing.T) {
+	// The underlying sequence may be entered exactly once.
+	for _, failAt := range []int{-1, 250} {
+		ranges := 0
+		n := 1000
+		seq := func(yield func(int, int) bool) {
+			ranges++
+			for i := 0; i < n; i++ {
+				key := i
+				if failAt >= 0 && i == failAt {
+					key = i - 1 // duplicate, aborts the single traversal
+				}
+				if !yield(key, -i) {
+					return
+				}
+			}
+		}
+		var b Map[int, int]
+		_, err := b.loadOrdered(n, seq)
+		if failAt >= 0 {
+			assert(err != nil)
+		} else {
+			assert(err == nil)
+			b.tree.Sane(nil)
+		}
+		assert(ranges == 1)
+	}
+
+	// A sequence that stops early is detected via the count check.
+	m, err := NewMapOrderedSeq(MapOptions[int, int]{}, 100, intSeq2(40))
+	assert(m == nil)
+	var oe *OrderedSeqError
+	assert(errors.As(err, &oe) && oe.Index == 40)
+}
+
+func TestMapOrderedSeqStrings(t *testing.T) {
+	// Keys deliberately share long prefixes, including first-8-byte prefix
+	// collisions, empty and NUL-bearing keys.
+	special := []string{
+		"",
+		"a",
+		"a\x00",
+		"a\x00b",
+		"abcdefgh",
+		"abcdefgh\x00",
+		"abcdefgh\x00x",
+		"abcdefghA",
+		"abcdefghB",
+	}
+	sorted := append([]string(nil), special...)
+	slices.Sort(sorted)
+	assert(slices.Equal(sorted, special))
+
+	for _, noprefix := range []bool{false, true} {
+		generated := 5000 // crosses the height 1 -> 2 boundary
+		n := len(special) + generated
+		isempty := func(k string, v int) bool { return k == "" && v == 0 }
+		seq := func(yield func(string, int) bool) {
+			for i, key := range special {
+				if !yield(key, i) {
+					return
+				}
+			}
+			for i := 0; i < generated; i++ {
+				key := fmt.Sprintf("zkey:%08d", i)
+				if !yield(key, len(special)+i) {
+					return
+				}
+			}
+		}
+
+		opts := MapOptions[string, int]{NoPrefix: noprefix}
+		b := NewMapOptions(opts)
+		stats, err := b.loadOrdered(n, seq)
+		assert(err == nil)
+		assert(b.Len() == n)
+		assert(b.tree.strpre == !noprefix)
+		assert(b.tree.Height() == bulkHeight(n))
+		b.tree.Sane(isempty)
+		bulkCheckShape(b.tree.root, 0, bulkHeight(n))
+		assert(stats.compares == n-1)
+		assert(stats.nodes == countBulkNodes(b.tree.root))
+
+		// Every key is reachable with the expected index and value.
+		for i, key := range special {
+			v, found := b.Lookup(key)
+			assert(found && v == i)
+			idx, found := b.IndexOf(key)
+			assert(found && idx == i)
+			gotKey, gotVal := b.GetAt(i)
+			assert(gotKey == key && gotVal == i)
+		}
+		for i := 0; i < generated; i++ {
+			key := fmt.Sprintf("zkey:%08d", i)
+			v, found := b.Lookup(key)
+			assert(found && v == len(special)+i)
+		}
+
+		// Clone, mutate, drain and further inserts all stay sane.
+		c := b.Clone()
+		c.tree.Sane(isempty)
+		c.Insert("zkey:99999999", n)
+		c.Delete("")
+		c.tree.Sane(isempty)
+		assert(c.Len() == n)
+		ex := b.DrainAt(0, 100)
+		assert(ex.Len() == 100)
+		b.tree.Sane(isempty)
+		assert(b.Len() == n-100)
+		var prev string
+		for key := range b.Keys() {
+			assert(prev < key)
+			prev = key
+		}
+	}
+}
+
+func TestMapOrderedSeqRandomSizes(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed: %d", seed)
+	rng := rand.New(rand.NewPCG(seed, seed))
+	isempty := func(k, v int) bool {
+		return k == 0 && v == 0
+	}
+	// Sweep random sizes spanning heights 0, 1 and 2, with extra picks
+	// around every capacity boundary.
+	for range 120 {
+		n := rng.IntN(20000)
+		switch rng.IntN(6) {
+		case 0:
+			n = minItems + rng.IntN(4) - 2
+		case 1:
+			n = maxItems + rng.IntN(4) - 2
+		case 2:
+			n = int(bulkCapMax(1)) + rng.IntN(5) - 2
+		}
+		if n < 0 {
+			n = 0
+		}
+		b := NewMap[int, int]()
+		stats, err := b.loadOrdered(n, intSeq2(n))
+		assert(err == nil)
+		assert(b.Len() == n)
+		assert(b.tree.Height() == bulkHeight(n))
+		b.tree.Sane(isempty)
+		bulkCheckShape(b.tree.root, 0, bulkHeight(n))
+		assert(stats.compares == max(0, n-1))
+		assert(stats.nodes == countBulkNodes(b.tree.root))
+
+		// Every index resolves to the expected item, including a random
+		// sample of direct lookups.
+		for j := 0; j < n; j++ {
+			key, value := b.GetAt(j)
+			assert(key == j && value == -j)
+		}
+		for range min(n, 50) {
+			j := rng.IntN(max(n, 1))
+			v, found := b.Lookup(j)
+			assert(found && v == -j)
+			idx, found := b.IndexOf(j)
+			assert(found && idx == j)
+		}
+
+		// Random deletes followed by inserts preserve every invariant.
+		if n > 10 {
+			for range min(n/4, 20) {
+				j := rng.IntN(b.Len())
+				key, _, deleted := b.DeleteAt(j)
+				assert(deleted && key >= 0)
+			}
+			b.tree.Sane(isempty)
+			for i := range 10 {
+				key := n + 1000 + i // unique and beyond every existing key
+				_, inserted := b.Insert(key, -key)
+				assert(inserted)
+			}
+			b.tree.Sane(isempty)
+		}
+	}
 }
