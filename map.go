@@ -124,43 +124,66 @@ func (b *Map[K, V]) init() {
 // Returns true if inserted or false if already exists.
 func (b *Map[K, V]) Insert(key K, value V) (V, bool) {
 	b.init()
+	var prev V
+	var ok bool
 	if b.tree.alt {
-		return b.altInsert(key, value)
+		prev, ok = b.altInsert(key, value)
 	} else {
-		return b.insert(key, value)
+		prev, ok = b.insert(key, value)
 	}
+	if ok {
+		b.tree.ver++
+	}
+	return prev, ok
 }
 
 // Replace existing item
 // Returns true if replaced, of false if not exists.
 func (b *Map[K, V]) Replace(key K, value V) (V, bool) {
 	b.init()
+	var prev V
+	var ok bool
 	if b.tree.alt {
-		return b.altReplace(key, value)
+		prev, ok = b.altReplace(key, value)
 	} else {
-		return b.replace(key, value)
+		prev, ok = b.replace(key, value)
 	}
+	if ok {
+		b.tree.ver++
+	}
+	return prev, ok
 }
 
 // Set inserts or replaces item.
 // Returns true if replaced or false if inserted
 func (b *Map[K, V]) Set(key K, value V) (V, bool) {
 	b.init()
+	var prev V
+	var ok bool
 	if b.tree.alt {
-		return b.altSet(key, value)
+		prev, ok = b.altSet(key, value)
 	} else {
-		return b.set(key, value)
+		prev, ok = b.set(key, value)
 	}
+	// Set always performs an actual change (insert or replace).
+	b.tree.ver++
+	return prev, ok
 
 }
 
 // Delete item from map.
 func (b *Map[K, V]) Delete(key K) (V, bool) {
+	var prev V
+	var ok bool
 	if b.tree.alt {
-		return b.altDelete(key)
+		prev, ok = b.altDelete(key)
 	} else {
-		return b.delete(key)
+		prev, ok = b.delete(key)
 	}
+	if ok {
+		b.tree.ver++
+	}
+	return prev, ok
 }
 
 // Contains returns true if item exists
@@ -202,11 +225,18 @@ func (b *Map[K, V]) Lookup(key K) (V, bool) {
 // Returns true if found or false if not found
 // MUTABLE OPERATION
 func (b *Map[K, V]) LookupMut(key K) (V, bool) {
+	var v V
+	var ok bool
 	if b.tree.alt {
-		return b.altLookupMut(key)
+		v, ok = b.altLookupMut(key)
 	} else {
-		return b.lookupMut(key)
+		v, ok = b.lookupMut(key)
 	}
+	if ok {
+		// A mutable value was handed to the caller.
+		b.tree.ver++
+	}
+	return v, ok
 }
 
 // Get an item
@@ -233,11 +263,11 @@ const (
 // - ActionGet: do nothing
 // - ActionDelete: delete item
 // - ActionReplace: replace with returned value
-func (b *Map[K, V]) Action(key K, action func(V) (V, Action)) {
+func (b *Map[K, V]) action0(key K, action func(V) (V, Action)) bool {
 	var emptyKey K
 	var emptyValue V
 	if b.tree.count == 0 || action == nil {
-		return
+		return false
 	}
 	b.tree.cowRoot(true)
 	var path [24]byte
@@ -256,9 +286,11 @@ func (b *Map[K, V]) Action(key K, action func(V) (V, Action)) {
 				switch act {
 				case ActionGet:
 					// do nothing
+					return false
 				case ActionReplace:
 					// replace in-place
 					n.values[i] = val
+					return true
 				case ActionDelete:
 					if fanout < 256 && n.leaf() && n.len > minItems {
 						// delete in-place and fixup counts
@@ -273,21 +305,29 @@ func (b *Map[K, V]) Action(key K, action func(V) (V, Action)) {
 							n.branch.counts[path[i]]--
 							n = n.branch.children[path[i]]
 						}
+						return true
 					} else {
 						// fallback to standard deletion
-						b.Delete(key)
+						_, deleted := b.delete(key)
+						return deleted
 					}
 				}
-				return
+				return false
 			}
 		}
 		if n.leaf() {
-			return
+			return false
 		}
 		b.tree.cowChild(n, i, true)
 		n = n.branch.children[i]
 		path[depth] = byte(i)
 		depth++
+	}
+}
+
+func (b *Map[K, V]) Action(key K, action func(V) (V, Action)) {
+	if b.action0(key, action) {
+		b.tree.ver++
 	}
 }
 
@@ -301,7 +341,7 @@ func (b *Map[K, V]) Ascend(key K) iter.Seq2[K, V] {
 // MUTABLE OPERATION
 func (b *Map[K, V]) AscendMut(key K) iter.Seq2[K, V] {
 	var emptyValue V
-	return b.tree.AscendMut(key, emptyValue)
+	return bumpMutSeq(&b.tree, b.tree.AscendMut(key, emptyValue))
 }
 
 // Len returns the number of items in map
@@ -312,6 +352,7 @@ func (b *Map[K, V]) Len() int {
 // Clear the map
 func (b *Map[K, V]) Clear() {
 	b.tree.Clear()
+	b.tree.ver++
 }
 
 // Release clears the map and release any references.
@@ -319,6 +360,7 @@ func (b *Map[K, V]) Clear() {
 // collections that are cloned.
 func (b *Map[K, V]) Release() {
 	b.tree.Release()
+	b.tree.ver++
 }
 
 func (b *Map[K, V]) cloneInto(b2 *Map[K, V]) {
@@ -339,7 +381,12 @@ func (b *Map[K, V]) Clone() *Map[K, V] {
 // Returns the deleted items as an ordered extract that can be iterated over.
 func (b *Map[K, V]) DrainAtOptions(index, count int, opts DrainOptions,
 ) Extract2[K, V] {
-	return b.tree.DrainAt(index, count, opts)
+	before := b.tree.count
+	ex := b.tree.DrainAt(index, count, opts)
+	if b.tree.count != before {
+		b.tree.ver++
+	}
+	return ex
 }
 
 // DrainOptions will delete all items within the provided min (inclusive)
@@ -347,7 +394,12 @@ func (b *Map[K, V]) DrainAtOptions(index, count int, opts DrainOptions,
 // Returns the deleted items as an ordered extract that can be iterated over.
 func (b *Map[K, V]) DrainOptions(min, max K, opts DrainOptions) Extract2[K, V] {
 	var emptyValue V
-	return b.tree.Drain(min, emptyValue, max, emptyValue, opts)
+	before := b.tree.count
+	ex := b.tree.Drain(min, emptyValue, max, emptyValue, opts)
+	if b.tree.count != before {
+		b.tree.ver++
+	}
+	return ex
 }
 
 // DrainAt will delete all items within the provided index and count
@@ -374,7 +426,7 @@ func (b *Map[K, V]) Descend(key K) iter.Seq2[K, V] {
 // MUTABLE OPERATION
 func (b *Map[K, V]) DescendMut(key K) iter.Seq2[K, V] {
 	var emptyValue V
-	return b.tree.DescendMut(key, emptyValue)
+	return bumpMutSeq(&b.tree, b.tree.DescendMut(key, emptyValue))
 }
 
 // IndexOf returns the index of key
@@ -391,7 +443,7 @@ func (b *Map[K, V]) All() iter.Seq2[K, V] {
 // AllMut returns an iterator of all items in map.
 // MUTABLE OPERATION
 func (b *Map[K, V]) AllMut() iter.Seq2[K, V] {
-	return b.tree.AllMut()
+	return bumpMutSeq(&b.tree, b.tree.AllMut())
 }
 
 // Backward returns an iterator of all items in map, in reverse order.
@@ -402,7 +454,7 @@ func (b *Map[K, V]) Backward() iter.Seq2[K, V] {
 // BackwardMut returns an iterator of all items in map, in reverse order.
 // MUTABLE OPERATION
 func (b *Map[K, V]) BackwardMut() iter.Seq2[K, V] {
-	return b.tree.BackwardMut()
+	return bumpMutSeq(&b.tree, b.tree.BackwardMut())
 }
 
 // AscendAt returns an iterator starting at index
@@ -413,7 +465,7 @@ func (b *Map[K, V]) AscendAt(index int) iter.Seq2[K, V] {
 // AscendAtMut returns an iterator starting at index
 // MUTABLE OPERATION
 func (b *Map[K, V]) AscendAtMut(index int) iter.Seq2[K, V] {
-	return b.tree.AscendAtMut(index)
+	return bumpMutSeq(&b.tree, b.tree.AscendAtMut(index))
 }
 
 // DescendAt returns an iterator starting at index, in reverse order
@@ -424,39 +476,63 @@ func (b *Map[K, V]) DescendAt(index int) iter.Seq2[K, V] {
 // DescendAtMut returns an iterator starting at index, in reverse order
 // MUTABLE OPERATION
 func (b *Map[K, V]) DescendAtMut(index int) iter.Seq2[K, V] {
-	return b.tree.DescendAtMut(index)
+	return bumpMutSeq(&b.tree, b.tree.DescendAtMut(index))
 }
 
 // PushFront insertes item to front of map.
 func (b *Map[K, V]) PushFront(key K, value V) bool {
 	b.init()
-	return b.tree.PushFront(key, value)
+	ok := b.tree.PushFront(key, value)
+	if ok {
+		b.tree.ver++
+	}
+	return ok
 }
 
 // PushBack insertes item to back of map.
 func (b *Map[K, V]) PushBack(key K, value V) bool {
 	b.init()
-	return b.tree.PushBack(key, value)
+	ok := b.tree.PushBack(key, value)
+	if ok {
+		b.tree.ver++
+	}
+	return ok
 }
 
 // PopFront removes first item.
 func (b *Map[K, V]) PopFront() (K, V, bool) {
-	return b.tree.PopFront()
+	k, v, ok := b.tree.PopFront()
+	if ok {
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // PopBack removes last item.
 func (b *Map[K, V]) PopBack() (K, V, bool) {
-	return b.tree.PopBack()
+	k, v, ok := b.tree.PopBack()
+	if ok {
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // PopFrontFunc removes first item if provided function allows.
 func (b *Map[K, V]) PopFrontFunc(cond func(key K, value V) bool) (K, V, bool) {
-	return b.tree.PopFrontFunc(cond)
+	k, v, ok := b.tree.PopFrontFunc(cond)
+	if ok {
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // PopBackFunc removes last item if provided function allows.
 func (b *Map[K, V]) PopBackFunc(cond func(key K, value V) bool) (K, V, bool) {
-	return b.tree.PopBackFunc(cond)
+	k, v, ok := b.tree.PopBackFunc(cond)
+	if ok {
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // Front returns first item
@@ -471,30 +547,52 @@ func (b *Map[K, V]) Back() (K, V, bool) {
 
 // Front returns first item
 func (b *Map[K, V]) FrontMut() (K, V, bool) {
-	return b.tree.FrontMut()
+	k, v, ok := b.tree.FrontMut()
+	if ok {
+		// A mutable value was handed to the caller.
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // BackMut returns first item
 // MUTABLE OPERATION
 func (b *Map[K, V]) BackMut() (K, V, bool) {
-	return b.tree.BackMut()
+	k, v, ok := b.tree.BackMut()
+	if ok {
+		// A mutable value was handed to the caller.
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // InsertAt inserts item at index
 func (b *Map[K, V]) InsertAt(index int, key K, value V) bool {
 	b.init()
-	return b.tree.InsertAt(index, key, value)
+	ok := b.tree.InsertAt(index, key, value)
+	if ok {
+		b.tree.ver++
+	}
+	return ok
 }
 
 // DeleteAt deletes item at index
 func (b *Map[K, V]) DeleteAt(index int) (K, V, bool) {
-	return b.tree.DeleteAt(index)
+	k, v, ok := b.tree.DeleteAt(index)
+	if ok {
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // ReplaceAt replaces item at index
 func (b *Map[K, V]) ReplaceAt(index int, key K, value V) (K, V, bool) {
 	b.init()
-	return b.tree.ReplaceAt(index, key, value)
+	oldK, oldV, ok := b.tree.ReplaceAt(index, key, value)
+	if ok {
+		b.tree.ver++
+	}
+	return oldK, oldV, ok
 }
 
 // LookupAt returns item at index
@@ -505,7 +603,12 @@ func (b *Map[K, V]) LookupAt(index int) (K, V, bool) {
 // LookupAtMut returns item at index
 // MUTABLE OPERATION
 func (b *Map[K, V]) LookupAtMut(index int) (K, V, bool) {
-	return b.tree.LookupAtMut(index)
+	k, v, ok := b.tree.LookupAtMut(index)
+	if ok {
+		// A mutable value was handed to the caller.
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // GetAt returns item at index
@@ -516,6 +619,10 @@ func (b *Map[K, V]) GetAt(index int) (K, V) {
 // GetAtMut returns item at index
 // MUTABLE OPERATION
 func (b *Map[K, V]) GetAtMut(index int) (K, V) {
+	if index >= 0 && index < b.Len() {
+		// A mutable value was handed to the caller.
+		b.tree.ver++
+	}
 	return b.tree.GetAtMut(index)
 }
 
@@ -532,7 +639,7 @@ func (b *Map[K, V]) Values() iter.Seq[V] {
 // ValuesMut returns an iterator of all values.
 // MUTABLE OPERATION
 func (b *Map[K, V]) ValuesMut() iter.Seq[V] {
-	return iterV(b.tree.AllMut())
+	return iterV(b.AllMut())
 }
 
 // Seek returns the first item that is >= key
@@ -545,7 +652,12 @@ func (b *Map[K, V]) Seek(key K) (K, V, bool) {
 // MUTABLE OPERATION
 func (b *Map[K, V]) SeekMut(key K) (K, V, bool) {
 	var emptyValue V
-	return b.tree.SeekMut(key, emptyValue)
+	k, v, ok := b.tree.SeekMut(key, emptyValue)
+	if ok {
+		// A mutable value was handed to the caller.
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // SeekNext returns the first item that is > key
@@ -558,7 +670,12 @@ func (b *Map[K, V]) SeekNext(key K) (K, V, bool) {
 // MUTABLE OPERATION
 func (b *Map[K, V]) SeekNextMut(key K) (K, V, bool) {
 	var emptyValue V
-	return b.tree.SeekNextMut(key, emptyValue)
+	k, v, ok := b.tree.SeekNextMut(key, emptyValue)
+	if ok {
+		// A mutable value was handed to the caller.
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // SeekPrev returns the first item that is < key
@@ -571,7 +688,12 @@ func (b *Map[K, V]) SeekPrev(key K) (K, V, bool) {
 // MUTABLE OPERATION
 func (b *Map[K, V]) SeekPrevMut(key K) (K, V, bool) {
 	var emptyValue V
-	return b.tree.SeekPrevMut(key, emptyValue)
+	k, v, ok := b.tree.SeekPrevMut(key, emptyValue)
+	if ok {
+		// A mutable value was handed to the caller.
+		b.tree.ver++
+	}
+	return k, v, ok
 }
 
 // String returns a string representation of map
@@ -597,7 +719,11 @@ func (b *Map[K, V]) DeleteFunc(del func(K, V) bool) bool {
 more:
 	for k, v := range b.AscendAt(index) {
 		if del(k, v) {
-			_, _, ok = b.DeleteAt(index)
+			_, _, deleted := b.tree.DeleteAt(index)
+			if deleted {
+				b.tree.ver++
+				ok = true
+			}
 			goto more
 		}
 		index++

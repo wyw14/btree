@@ -28,6 +28,7 @@ type tree[K, V any] struct {
 	initd       bool        // flag used by outer types
 	count       int         // total tree count
 	root        *node[K, V] // root node
+	ver         uint64      // structure version (Map cursor invalidation)
 	dataCopy    func(V) V   // Value data copy-on-write
 	dataRelease func(V)     // Value data on release
 	dataCompare func(K, V, K, V) int
