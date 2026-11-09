@@ -2004,3 +2004,259 @@ func prefixString[K any](key K) uint64 {
 		uint64(b[4])<<24 | uint64(b[3])<<32 | uint64(b[2])<<40 |
 		uint64(b[1])<<48 | uint64(b[0])<<56
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Join (concatenate two disjoint trees)
+////////////////////////////////////////////////////////////////////////////////
+
+// joinCarry is the result of fusing nodes at one level. It holds either one
+// node (no separator) or two nodes plus a single separator item that must be
+// lifted into the parent level.
+type joinCarry[K, V any] struct {
+	n      int // 1 or 2
+	nodes  [2]*node[K, V]
+	sepKey K
+	sepVal V
+}
+
+func joinCarryOne[K, V any](n *node[K, V]) joinCarry[K, V] {
+	return joinCarry[K, V]{n: 1, nodes: [2]*node[K, V]{n}}
+}
+
+func (t *tree[K, V]) joinMakeLeaf(keys []K, vals []V) *node[K, V] {
+	n := t.newNode(true)
+	n.len = len(keys)
+	copy(n.keys[:], keys)
+	copy(n.values[:], vals)
+	return n
+}
+
+func (t *tree[K, V]) joinMakeBranch(keys []K, vals []V,
+	children []*node[K, V], counts []int,
+) *node[K, V] {
+	n := t.newNode(false)
+	n.len = len(keys)
+	copy(n.keys[:], keys)
+	copy(n.values[:], vals)
+	copy(n.branch.children[:], children)
+	copy(n.branch.counts[:], counts)
+	if n.branch.prefixes != nil {
+		for i := range keys {
+			n.branch.prefixes[i] = prefixString(keys[i])
+		}
+	}
+	return n
+}
+
+// Pack a fused leaf item array into one node or two nodes plus a separator.
+func (t *tree[K, V]) joinPackLeaf(keys []K, vals []V) joinCarry[K, V] {
+	total := len(keys)
+	if total <= maxItems {
+		return joinCarryOne(t.joinMakeLeaf(keys[:total], vals[:total]))
+	}
+	s := total / 2
+	c := joinCarry[K, V]{
+		n:      2,
+		sepKey: keys[s],
+		sepVal: vals[s],
+	}
+	c.nodes[0] = t.joinMakeLeaf(keys[:s], vals[:s])
+	c.nodes[1] = t.joinMakeLeaf(keys[s+1:total], vals[s+1:total])
+	return c
+}
+
+// Pack a fused branch item/child array into one node or two nodes plus a
+// separator.
+func (t *tree[K, V]) joinPackBranch(keys []K, vals []V,
+	children []*node[K, V], counts []int,
+) joinCarry[K, V] {
+	total := len(keys)
+	if total <= maxItems {
+		return joinCarryOne(t.joinMakeBranch(keys[:total], vals[:total],
+			children[:total+1], counts[:total+1]))
+	}
+	s := total / 2
+	c := joinCarry[K, V]{
+		n:      2,
+		sepKey: keys[s],
+		sepVal: vals[s],
+	}
+	c.nodes[0] = t.joinMakeBranch(keys[:s], vals[:s],
+		children[:s+1], counts[:s+1])
+	c.nodes[1] = t.joinMakeBranch(keys[s+1:total], vals[s+1:total],
+		children[s+1:total+1], counts[s+1:total+1])
+	return c
+}
+
+// Fuse two adjacent equal-height leaf nodes into a carry.
+func (t *tree[K, V]) joinFuseLeaf(ln, rn *node[K, V]) joinCarry[K, V] {
+	var keys [2 * maxItems]K
+	var vals [2 * maxItems]V
+	n := ln.len + rn.len
+	copy(keys[:ln.len], ln.keys[:ln.len])
+	copy(keys[ln.len:n], rn.keys[:rn.len])
+	copy(vals[:ln.len], ln.values[:ln.len])
+	copy(vals[ln.len:n], rn.values[:rn.len])
+	return t.joinPackLeaf(keys[:n], vals[:n])
+}
+
+// Fuse two adjacent equal-height branch nodes into a carry. The bridge carry
+// comes from fusing the boundary children (ln last child and rn first child)
+// and is either one node with no separator or two nodes with one separator.
+func (t *tree[K, V]) joinFuseBranch(ln, rn *node[K, V],
+	br joinCarry[K, V],
+) joinCarry[K, V] {
+	var keys [2*maxItems + 1]K
+	var vals [2*maxItems + 1]V
+	var children [2*maxItems + 2]*node[K, V]
+	var counts [2*maxItems + 2]int
+	nk, nc := 0, 0
+	// All of ln except its last (boundary) child.
+	copy(keys[nk:], ln.keys[:ln.len])
+	copy(vals[nk:], ln.values[:ln.len])
+	nk += ln.len
+	copy(children[nc:], ln.branch.children[:ln.len])
+	copy(counts[nc:], ln.branch.counts[:ln.len])
+	nc += ln.len
+	// The bridge node(s).
+	for j := 0; j < br.n; j++ {
+		children[nc] = br.nodes[j]
+		counts[nc] = br.nodes[j].count()
+		nc++
+	}
+	if br.n == 2 {
+		keys[nk] = br.sepKey
+		vals[nk] = br.sepVal
+		nk++
+	}
+	// All of rn except its first (boundary) child.
+	copy(keys[nk:], rn.keys[:rn.len])
+	copy(vals[nk:], rn.values[:rn.len])
+	nk += rn.len
+	copy(children[nc:], rn.branch.children[1:rn.len+1])
+	copy(counts[nc:], rn.branch.counts[1:rn.len+1])
+	nc += rn.len
+	return t.joinPackBranch(keys[:nk], vals[:nk], children[:nc],
+		counts[:nc])
+}
+
+// Merge two private equal-height adjacent subtrees whose key ranges are
+// disjoint. Returns either one node or two nodes plus a separator.
+func (t *tree[K, V]) joinEqual(ln, rn *node[K, V]) joinCarry[K, V] {
+	if ln.leaf() {
+		return t.joinFuseLeaf(ln, rn)
+	}
+	t.cowChild(ln, ln.len, true)
+	t.cowChild(rn, 0, true)
+	br := t.joinEqual(ln.branch.children[ln.len], rn.branch.children[0])
+	return t.joinFuseBranch(ln, rn, br)
+}
+
+// Rewire a branch node p so that child slot i is replaced by the carry (one
+// node, or two nodes plus a separator). Returns the resulting carry.
+func (t *tree[K, V]) joinInsertCarry(p *node[K, V], i int,
+	br joinCarry[K, V],
+) joinCarry[K, V] {
+	if br.n == 1 {
+		p.branch.children[i] = br.nodes[0]
+		p.branch.counts[i] = br.nodes[0].count()
+		return joinCarryOne(p)
+	}
+	if p.len < maxItems {
+		t.insertBranchItemAt(p, br.sepKey, br.sepVal, i)
+		p.branch.children[i] = br.nodes[0]
+		p.insertChildAt(br.nodes[1], i+1)
+		p.branch.counts[i] = br.nodes[0].count()
+		p.branch.counts[i+1] = br.nodes[1].count()
+		return joinCarryOne(p)
+	}
+	// Parent is full: build the overflow arrays and split.
+	var keys [maxItems + 1]K
+	var vals [maxItems + 1]V
+	var children [maxItems + 2]*node[K, V]
+	var counts [maxItems + 2]int
+	copy(keys[:i], p.keys[:i])
+	copy(vals[:i], p.values[:i])
+	keys[i] = br.sepKey
+	vals[i] = br.sepVal
+	copy(keys[i+1:], p.keys[i:p.len])
+	copy(vals[i+1:], p.values[i:p.len])
+	copy(children[:i], p.branch.children[:i])
+	copy(counts[:i], p.branch.counts[:i])
+	children[i] = br.nodes[0]
+	children[i+1] = br.nodes[1]
+	counts[i] = br.nodes[0].count()
+	counts[i+1] = br.nodes[1].count()
+	copy(children[i+2:], p.branch.children[i+1:p.len+1])
+	copy(counts[i+2:], p.branch.counts[i+1:p.len+1])
+	total := p.len + 1
+	return t.joinPackBranch(keys[:total], vals[:total],
+		children[:total+1], counts[:total+1])
+}
+
+// Left tree (receiver side) is equal or taller: follow its right spine.
+func (t *tree[K, V]) joinLTaller(ln, rn *node[K, V], d int) joinCarry[K, V] {
+	if d == 0 {
+		return t.joinEqual(ln, rn)
+	}
+	i := ln.len
+	t.cowChild(ln, i, true)
+	br := t.joinLTaller(ln.branch.children[i], rn, d-1)
+	return t.joinInsertCarry(ln, i, br)
+}
+
+// Right tree (other side) is taller: follow its left spine.
+func (t *tree[K, V]) joinRTaller(ln, rn *node[K, V], d int) joinCarry[K, V] {
+	if d == 0 {
+		return t.joinEqual(ln, rn)
+	}
+	i := 0
+	t.cowChild(rn, i, true)
+	br := t.joinRTaller(ln, rn.branch.children[i], d-1)
+	return t.joinInsertCarry(rn, i, br)
+}
+
+// Concatenate the disjoint tree o immediately after t. All validation must
+// have already happened; this only performs the structural work and consumes
+// o by transferring ownership of its root without releasing it.
+func (t *tree[K, V]) joinAdopt(o *tree[K, V]) {
+	t.cloned = t.cloned || o.cloned
+	if t.count == 0 {
+		t.root = o.root
+		t.count = o.count
+		o.root = nil
+		o.count = 0
+		return
+	}
+	if o.count == 0 {
+		return
+	}
+	t.cowRoot(true)
+	o.cowRoot(true)
+	hl, hr := t.Height(), o.Height()
+	var res joinCarry[K, V]
+	if hl >= hr {
+		res = t.joinLTaller(t.root, o.root, hl-hr)
+	} else {
+		res = t.joinRTaller(t.root, o.root, hr-hl)
+	}
+	if res.n == 1 {
+		t.root = res.nodes[0]
+	} else {
+		root := t.newNode(false)
+		root.len = 1
+		root.keys[0] = res.sepKey
+		root.values[0] = res.sepVal
+		root.branch.children[0] = res.nodes[0]
+		root.branch.children[1] = res.nodes[1]
+		root.branch.counts[0] = res.nodes[0].count()
+		root.branch.counts[1] = res.nodes[1].count()
+		if root.branch.prefixes != nil {
+			root.branch.prefixes[0] = prefixString(res.sepKey)
+		}
+		t.root = root
+	}
+	t.count += o.count
+	o.root = nil
+	o.count = 0
+}

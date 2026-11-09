@@ -9,9 +9,11 @@ package btree
 import (
 	"bytes"
 	"cmp"
+	"errors"
 	"fmt"
 	"iter"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -4918,4 +4920,450 @@ func TestMapStringKey3(t *testing.T) {
 		assert(v == "")
 	}
 	assert(m.Len() == N)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// JoinRight
+////////////////////////////////////////////////////////////////////////////////
+
+func joinFillInts(m *Map[int, int], lo, hi int) {
+	for i := lo; i < hi; i++ {
+		_, inserted := m.Set(i, i)
+		assert(!inserted)
+	}
+}
+
+func joinCheckInts(m *Map[int, int], lo, hi int) {
+	n := hi - lo
+	assert(m.Len() == n)
+	m.tree.Sane(nil)
+	i := 0
+	for k, v := range m.All() {
+		assert(k == lo+i)
+		assert(v == k)
+		i++
+	}
+	assert(i == n)
+	// Backward order.
+	i = n - 1
+	for k := range m.Backward() {
+		assert(k == lo+i)
+		i--
+	}
+	assert(i == -1)
+	// GetAt / IndexOf for small maps, sampled for large ones.
+	checks := []int{0, n - 1}
+	if n <= 5000 {
+		checks = make([]int, n)
+		for j := range n {
+			checks[j] = j
+		}
+	} else {
+		for _, j := range []int{1, n / 4, n / 3, n / 2, 2 * n / 3, n - 2} {
+			checks = append(checks, j)
+		}
+	}
+	for _, j := range checks {
+		if j < 0 || j >= n {
+			continue
+		}
+		k, v := m.GetAt(j)
+		assert(k == lo+j && v == k)
+		idx, ok := m.IndexOf(lo + j)
+		assert(ok && idx == j)
+	}
+	f, _, fok := m.Front()
+	b, _, bok := m.Back()
+	assert(fok && bok && f == lo && b == hi-1)
+}
+
+func joinCollectNodes[K, V any](n *node[K, V],
+	set map[*node[K, V]]bool,
+) {
+	if n == nil {
+		return
+	}
+	set[n] = true
+	if !n.leaf() {
+		for i := 0; i <= n.len; i++ {
+			joinCollectNodes(n.branch.children[i], set)
+		}
+	}
+}
+
+// Deterministic size matrix covering height differences 0, 1 and multiple
+// levels, boundary leaves full/half, root growth and single-node trees.
+func TestMapJoinRightSizes(t *testing.T) {
+	sizes := [][2]int{
+		{1, 1},
+		{31, 32}, // fused leaf fits exactly (63 items, half/half boundary)
+		{32, 31},
+		{32, 32}, // fused leaf overflows (64 items)
+		{63, 63}, // both boundary leaves full
+		{63, 1},
+		{1, 63},
+		{64, 64}, // equal height 1
+		{100, 100},
+		{4095, 1}, // maxed height-1 left tree, single leaf right
+		{1, 4095},
+		{5000, 50}, // height 2 vs height 0 (multi-level difference)
+		{50, 5000},
+		{5000, 5000},  // equal height 2
+		{300000, 100}, // height 3 vs height 1 (multi-level)
+		{100, 300000},
+	}
+	for _, sz := range sizes {
+		ln, rn := sz[0], sz[1]
+		l := NewMap[int, int]()
+		r := NewMap[int, int]()
+		joinFillInts(l, 0, ln)
+		joinFillInts(r, ln, ln+rn)
+		hl, hr := l.tree.Height(), r.tree.Height()
+		err := l.JoinRight(r)
+		assert(err == nil)
+		assert(r.Len() == 0 && r.tree.root == nil)
+		joinCheckInts(l, 0, ln+rn)
+		// other is reusable after being consumed.
+		_, inserted := r.Set(ln+rn, ln+rn)
+		assert(!inserted)
+		r.tree.Sane(nil)
+		assert(r.Len() == 1)
+		// Joined tree height must match a tree built with the same items.
+		ref := NewMap[int, int]()
+		joinFillInts(ref, 0, ln+rn)
+		assert(l.tree.Height() == ref.tree.Height())
+		t.Logf("sizes (%d,%d) heights (%d,%d) -> %d", ln, rn, hl, hr,
+			l.tree.Height())
+	}
+}
+
+// Randomized fuzz: shuffled inserts, random sizes (including different
+// heights), optional gaps between the key ranges.
+func TestMapJoinRightFuzz(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed: %d", seed)
+	rng := rand.New(rand.NewPCG(seed, seed))
+	for iter := 0; iter < 80; iter++ {
+		ln := 1 + rng.IntN(3000)
+		rn := 1 + rng.IntN(3000)
+		gap := rng.IntN(5)
+		base := ln + gap
+		l := NewMap[int, int]()
+		r := NewMap[int, int]()
+		for _, i := range rng.Perm(ln) {
+			l.Set(i, i)
+		}
+		for _, i := range rng.Perm(rn) {
+			r.Set(base+i, base+i)
+		}
+		l.tree.Sane(nil)
+		r.tree.Sane(nil)
+		err := l.JoinRight(r)
+		assert(err == nil)
+		assert(r.Len() == 0)
+		// Expected sequence: 0..ln-1 then base..base+rn-1.
+		assert(l.Len() == ln+rn)
+		l.tree.Sane(nil)
+		var got []int
+		for k := range l.Keys() {
+			got = append(got, k)
+		}
+		var want []int
+		for i := 0; i < ln; i++ {
+			want = append(want, i)
+		}
+		for i := 0; i < rn; i++ {
+			want = append(want, base+i)
+		}
+		assert(slices.Equal(got, want))
+		for j := range ln + rn {
+			k, v := l.GetAt(j)
+			assert(k == want[j] && v == want[j])
+			idx, ok := l.IndexOf(want[j])
+			assert(ok && idx == j)
+		}
+	}
+}
+
+// All error paths reject before touching either tree.
+func TestMapJoinRightErrors(t *testing.T) {
+	// Self join.
+	m := NewMap[int, int]()
+	joinFillInts(m, 0, 10)
+	assert(errors.Is(m.JoinRight(m), ErrJoinSelf))
+	joinCheckInts(m, 0, 10)
+	// Self join on an empty map is still an error.
+	var empty Map[int, int]
+	assert(errors.Is(empty.JoinRight(&empty), ErrJoinSelf))
+
+	// Equal boundary key.
+	l := NewMap[int, int]()
+	r := NewMap[int, int]()
+	joinFillInts(l, 0, 10)
+	joinFillInts(r, 9, 20)
+	assert(errors.Is(l.JoinRight(r), ErrJoinOrder))
+	joinCheckInts(l, 0, 10)
+	joinCheckInts(r, 9, 20)
+
+	// Overlapping ranges.
+	l2 := NewMap[int, int]()
+	r2 := NewMap[int, int]()
+	joinFillInts(l2, 0, 20)
+	joinFillInts(r2, 5, 8)
+	assert(errors.Is(l2.JoinRight(r2), ErrJoinOrder))
+	joinCheckInts(l2, 0, 20)
+	joinCheckInts(r2, 5, 8)
+
+	// Option incompatibility: Copy callback set on either side.
+	withCopy := NewMapOptions(MapOptions[int, int]{
+		Copy: func(v int) int { return v },
+	})
+	assert(errors.Is(withCopy.JoinRight(NewMap[int, int]()),
+		ErrJoinOptions))
+	assert(errors.Is(NewMap[int, int]().JoinRight(withCopy),
+		ErrJoinOptions))
+	// Two non-nil callbacks are still rejected: pointers are not compared.
+	withCopy2 := NewMapOptions(MapOptions[int, int]{
+		Copy: func(v int) int { return v },
+	})
+	assert(errors.Is(withCopy.JoinRight(withCopy2), ErrJoinOptions))
+	// Release callback set on either side.
+	withRelease := NewMapOptions(MapOptions[int, int]{
+		Release: func(int) {},
+	})
+	assert(errors.Is(NewMap[int, int]().JoinRight(withRelease),
+		ErrJoinOptions))
+	// NoPrefix mismatch.
+	strPre := NewMapOptions(MapOptions[string, int]{})
+	noPre := NewMapOptions(MapOptions[string, int]{NoPrefix: true})
+	assert(errors.Is(strPre.JoinRight(noPre), ErrJoinOptions))
+	assert(errors.Is(noPre.JoinRight(strPre), ErrJoinOptions))
+	// Option validation also applies to empty maps.
+	assert(errors.Is(NewMap[int, int]().JoinRight(withRelease),
+		ErrJoinOptions))
+	assert(withRelease.Len() == 0)
+
+	// Empty tree behavior once options are compatible.
+	var b, o Map[int, int]
+	joinFillInts(&o, 0, 100)
+	assert(b.JoinRight(&o) == nil)
+	assert(o.Len() == 0 && o.tree.root == nil)
+	joinCheckInts(&b, 0, 100)
+	// Joining an empty other is a no-op.
+	var e Map[int, int]
+	assert(b.JoinRight(&e) == nil)
+	joinCheckInts(&b, 0, 100)
+	// Two empty maps.
+	var e1, e2 Map[int, int]
+	assert(e1.JoinRight(&e2) == nil)
+	assert(e1.Len() == 0 && e2.Len() == 0)
+	// Consumed other can be reused.
+	_, inserted := o.Set(1000, 1000)
+	assert(!inserted)
+	o.tree.Sane(nil)
+}
+
+// String keys with shared prefixes, in both prefix and NoPrefix modes.
+func TestMapJoinRightString(t *testing.T) {
+	for _, noPrefix := range []bool{false, true} {
+		l := NewMapOptions(MapOptions[string, int]{NoPrefix: noPrefix})
+		r := NewMapOptions(MapOptions[string, int]{NoPrefix: noPrefix})
+		const n = 2000
+		for i := range n {
+			l.Set(fmt.Sprintf("shared:%06d", i), i)
+		}
+		for i := n; i < 2*n; i++ {
+			r.Set(fmt.Sprintf("shared:%06d", i), i)
+		}
+		assert(l.JoinRight(r) == nil)
+		assert(r.Len() == 0)
+		l.tree.Sane(func(k string, v int) bool { return k == "" && v == 0 })
+		assert(l.Len() == 2*n)
+		for i := range 2 * n {
+			key := fmt.Sprintf("shared:%06d", i)
+			v, ok := l.Lookup(key)
+			assert(ok && v == i)
+			idx, ok := l.IndexOf(key)
+			assert(ok && idx == i)
+			k, gv := l.GetAt(i)
+			assert(k == key && gv == i)
+		}
+	}
+}
+
+// Float ordered keys follow the existing cmp.Compare boundary semantics.
+func TestMapJoinRightFloat(t *testing.T) {
+	l := NewMap[float64, int]()
+	r := NewMap[float64, int]()
+	for i := 0; i < 100; i++ {
+		l.Set(float64(i)*0.5, i)
+	}
+	for i := 100; i < 200; i++ {
+		r.Set(float64(i)*0.5, i)
+	}
+	assert(l.JoinRight(r) == nil)
+	l.tree.Sane(nil)
+	assert(l.Len() == 200)
+	var prev float64 = -1e300
+	for k := range l.Keys() {
+		assert(cmp.Compare(prev, k) < 0)
+		prev = k
+	}
+	// -0.0 and +0.0 compare equal: boundary equality must be rejected.
+	neg := NewMap[float64, int]()
+	pos := NewMap[float64, int]()
+	neg.Set(-2, 0)
+	neg.Set(-1, 0)
+	neg.Set(math.Copysign(0, -1), 0)
+	pos.Set(0, 0)
+	pos.Set(1, 0)
+	assert(errors.Is(neg.JoinRight(pos), ErrJoinOrder))
+	assert(neg.Len() == 3 && pos.Len() == 2)
+	// Strictly ordered float boundary works.
+	lo := NewMap[float64, int]()
+	hi := NewMap[float64, int]()
+	lo.Set(1.5, 0)
+	hi.Set(2.5, 0)
+	assert(lo.JoinRight(hi) == nil)
+	assert(lo.Len() == 2)
+	lo.tree.Sane(nil)
+}
+
+// Clones on either side keep working independently after the join; node
+// reference counts must stay balanced through later mutations and releases.
+func TestMapJoinRightClone(t *testing.T) {
+	const n = 2000
+	build := func(lo, hi int) *Map[int, int] {
+		m := NewMap[int, int]()
+		joinFillInts(m, lo, hi)
+		return m
+	}
+	// Both sides cloned before the join.
+	l := build(0, n)
+	r := build(n, 2*n)
+	lc := l.Clone()
+	rc := r.Clone()
+	assert(l.JoinRight(r) == nil)
+	assert(r.Len() == 0)
+	l.tree.Sane(nil)
+	lc.tree.Sane(nil)
+	rc.tree.Sane(nil)
+	joinCheckInts(l, 0, 2*n)
+	joinCheckInts(lc, 0, n)
+	joinCheckInts(rc, n, 2*n)
+	// Rewrite every value in the joined map: clones must be unaffected.
+	for k := range 2 * n {
+		old, replaced := l.Set(k, -k)
+		assert(replaced && old == k)
+	}
+	l.Set(2*n, 2*n)
+	l.tree.Sane(nil)
+	joinCheckInts(lc, 0, n)
+	joinCheckInts(rc, n, 2*n)
+	// Independent writes into both clones.
+	for k := range 100 {
+		lc.Delete(k)
+		rc.Set(n+k, 999)
+	}
+	lc.Set(99999, 1)
+	rc.Set(88888, 1)
+	lc.tree.Sane(nil)
+	rc.tree.Sane(nil)
+	assert(lc.Len() == n-100+1)
+	assert(rc.Len() == n+1)
+	// Consumed other is reusable, also after being cloned again.
+	r2 := r.Clone()
+	r.Set(3*n, 3*n)
+	r.tree.Sane(nil)
+	r2.tree.Sane(nil)
+	// Releasing clones must not disturb the joined map or its node refs.
+	lc.Release()
+	rc.Release()
+	r2.Release()
+	for k := range 2 * n {
+		l.Set(k, k)
+	}
+	joinCheckInts(l, 0, 2*n+1)
+	l.Release()
+	r.Release()
+
+	// Receiver cloned but other not.
+	l = build(0, 500)
+	r = build(500, 1000)
+	lc = l.Clone()
+	assert(l.JoinRight(r) == nil)
+	joinCheckInts(l, 0, 1000)
+	joinCheckInts(lc, 0, 500)
+	lc.Release()
+	l.tree.Sane(nil)
+
+	// Other cloned but receiver not: cloned flag must propagate so later
+	// copy-on-write writes do not touch the clone's shared nodes.
+	l = build(0, 500)
+	r = build(500, 1000)
+	rc = r.Clone()
+	assert(l.JoinRight(r) == nil)
+	joinCheckInts(l, 0, 1000)
+	joinCheckInts(rc, 500, 1000)
+	for k := range 1000 {
+		v, replaced := l.Set(k, k+1)
+		assert(replaced && v == k)
+	}
+	l.tree.Sane(nil)
+	joinCheckInts(rc, 500, 1000)
+	rc.Release()
+	l.Release()
+
+	// Empty receiver adopts a cloned other.
+	var b Map[int, int]
+	r = build(0, 100)
+	rc = r.Clone()
+	assert(b.JoinRight(r) == nil)
+	joinCheckInts(&b, 0, 100)
+	joinCheckInts(rc, 0, 100)
+	b.Set(100, 100)
+	b.tree.Sane(nil)
+	joinCheckInts(rc, 0, 100)
+	rc.Release()
+	b.Release()
+}
+
+// A structural join must reuse almost all existing nodes. Per-item reinsertion
+// would drop every node of other (and rewrite receiver leaves), so assert the
+// number of node pointers lost from either tree is bounded by the spines.
+func TestMapJoinRightNodeReuse(t *testing.T) {
+	cases := [][2]int{
+		{5000, 5000},
+		{5000, 100},
+		{100, 5000},
+	}
+	for _, sz := range cases {
+		l := NewMap[int, int]()
+		r := NewMap[int, int]()
+		joinFillInts(l, 0, sz[0])
+		joinFillInts(r, sz[0], sz[0]+sz[1])
+		leftNodes := make(map[*node[int, int]]bool)
+		rightNodes := make(map[*node[int, int]]bool)
+		joinCollectNodes(l.tree.root, leftNodes)
+		joinCollectNodes(r.tree.root, rightNodes)
+		hl, hr := l.tree.Height(), r.tree.Height()
+		assert(l.JoinRight(r) == nil)
+		got := make(map[*node[int, int]]bool)
+		joinCollectNodes(l.tree.root, got)
+		keptLeft, keptRight := 0, 0
+		for n := range leftNodes {
+			if got[n] {
+				keptLeft++
+			}
+		}
+		for n := range rightNodes {
+			if got[n] {
+				keptRight++
+			}
+		}
+		budget := hl + hr + 4
+		assert(len(leftNodes)-keptLeft <= budget)
+		assert(len(rightNodes)-keptRight <= budget)
+		joinCheckInts(l, 0, sz[0]+sz[1])
+	}
 }

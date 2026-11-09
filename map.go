@@ -8,9 +8,25 @@ package btree
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"iter"
 	"unsafe"
+)
+
+// Errors returned by JoinRight.
+var (
+	// ErrJoinSelf is returned when joining a map with itself.
+	ErrJoinSelf = errors.New("btree: cannot join a map with itself")
+	// ErrJoinOptions is returned when the two maps were created with
+	// incompatible options. The first version of JoinRight only accepts maps
+	// that both have nil Copy and Release callbacks and that share the same
+	// NoPrefix setting.
+	ErrJoinOptions = errors.New("btree: incompatible map options")
+	// ErrJoinOrder is returned when every key of the receiver is not strictly
+	// less than every key of other, such as when boundary keys are equal or
+	// the ranges overlap.
+	ErrJoinOrder = errors.New("btree: map keys are not in strict order")
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -332,6 +348,52 @@ func (b *Map[K, V]) Clone() *Map[K, V] {
 	b2 := new(Map[K, V])
 	b.cloneInto(b2)
 	return b2
+}
+
+// JoinRight moves every item of other onto the end of b, consuming other in
+// the process. It succeeds only when all keys of b are strictly less than all
+// keys of other (the largest key of b must be below the smallest key of other).
+// On success b contains all items of both maps and other is left empty but
+// usable again.
+//
+// The two trees may have different heights. The join runs in
+// O(fanout*(height(b)+height(other))) time: it splices the trees together
+// along their edge nodes instead of reinserting items one by one.
+//
+// This first version only joins maps that both have nil Copy and Release
+// callbacks and that were created with the same NoPrefix setting; any other
+// option combination is rejected with ErrJoinOptions before either tree is
+// touched. Function pointers are never compared to guess compatibility.
+//
+// Joining a map with itself returns ErrJoinSelf, and equal boundary keys or
+// overlapping ranges return ErrJoinOrder; in every error case both maps are
+// left unchanged. Option validation also applies to empty maps.
+//
+// Maps that have been cloned are handled safely: ownership of other's tree is
+// transferred to b without disturbing existing clones or node reference
+// counts. JoinRight is not safe for concurrent use and does not roll back side
+// effects of external value callbacks.
+func (b *Map[K, V]) JoinRight(other *Map[K, V]) error {
+	if b == other {
+		return ErrJoinSelf
+	}
+	b.init()
+	other.init()
+	bt, ot := &b.tree, &other.tree
+	if bt.dataCopy != nil || ot.dataCopy != nil ||
+		bt.dataRelease != nil || ot.dataRelease != nil ||
+		bt.nopre != ot.nopre {
+		return ErrJoinOptions
+	}
+	if bt.count != 0 && ot.count != 0 {
+		lk, lv, _ := bt.Back()
+		rk, rv, _ := ot.Front()
+		if bt.dataCompare(lk, lv, rk, rv) >= 0 {
+			return ErrJoinOrder
+		}
+	}
+	bt.joinAdopt(ot)
+	return nil
 }
 
 // DrainAtOptions will delete all items within the provided index and
